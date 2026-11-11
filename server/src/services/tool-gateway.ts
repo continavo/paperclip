@@ -3257,7 +3257,21 @@ export function createToolGatewayService(
 
   /** Shared connection descriptors and task restrictions; no provider calls. */
   async function connectionToolsForContext(session: ToolGatewaySession): Promise<ToolGatewayDescriptor[]> {
-    const guestBotConnection = await measureRunPhase("connectors.discovery.github", () => githubGuestBotConnectionForSession(db, session));
+    let guestBotConnection: string | null = null;
+    let chatTools: ToolGatewayDescriptor[] = [];
+    try {
+      const guest = await measureRunPhase("connectors.discovery.github", () => githubGuestBotConnectionForSession(db, session));
+      const github = await measureRunPhase("connectors.discovery.github", () => githubBotToolsForSession(db, session));
+      const slack = await measureRunPhase("connectors.discovery.slack", () => slackToolsForSession(db, session));
+      // Commit chat discovery only after every helper accepts this context.
+      guestBotConnection = guest;
+      chatTools = [...github, ...slack];
+    } catch (error) {
+      if (!(error instanceof HttpError) || error.status !== 403 ||
+          error.message !== "Chat tools cannot be inherited by another task") throw error;
+      // An inherited chat identity contributes no chat tools or guest restriction.
+      // Other connected tools still pass through their existing grants and policy.
+    }
     let connectedTools = (await measureRunPhase("connectors.discovery.connections", () => connectedMcpToolsForCompany(session.companyId)))
       .filter(tool => !guestBotConnection || !tool.connectionId || (tool.connectionId === guestBotConnection && tool.providerType === "paperclip_github_chat"));
     const connectionIds = [...new Set(connectedTools.flatMap((tool) => tool.connectionId ? [tool.connectionId] : []))];
@@ -3274,8 +3288,7 @@ export function createToolGatewayService(
       }
     }
     return [
-      ...await measureRunPhase("connectors.discovery.github", () => githubBotToolsForSession(db, session)),
-      ...await measureRunPhase("connectors.discovery.slack", () => slackToolsForSession(db, session)),
+      ...chatTools,
       ...await measureRunPhase("connectors.discovery.speko", () => spekoToolsForSession(db, session)),
       ...connectedTools,
     ];

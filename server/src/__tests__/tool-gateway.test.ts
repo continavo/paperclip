@@ -19,6 +19,7 @@ import {
   connectionGrants,
   createDb,
   heartbeatRuns,
+  runIdentityContexts,
   issueThreadInteractions,
   issues,
   principalPermissionGrants,
@@ -59,6 +60,10 @@ import {
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
 import { resolveConnectionGrantSecret } from "../services/connection-credentials.js";
 import { secretService } from "../services/secrets.js";
+import { forbidden, HttpError } from "../errors.js";
+import { chatRunSourceMessageId } from "../services/chat-channels/run-origin.js";
+import * as githubChatTools from "../services/chat-github-tools.js";
+import * as slackChatTools from "../services/connectors/slack-catalog.js";
 import * as cogneeBridge from "../services/cognee-connection.js";
 import { createKvDemoHttpServer, type KvDemoHttpServer } from "../../../packages/kv-demo-mcp-server/src/http.js";
 import {
@@ -561,6 +566,8 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
   }, 90_000);
 
   afterEach(async () => {
+    vi.restoreAllMocks();
+    await db.delete(runIdentityContexts);
     await db.delete(activityLog);
     await db.delete(toolCallEvents);
     await db.delete(toolRuntimeSlots);
@@ -597,6 +604,93 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
   afterAll(async () => {
     await db?.$client.end({ timeout: 1 });
     await tempDb?.cleanup();
+  });
+
+  it.each([false, true])("lists connected MCP tools with chat identity on the same task: %s", async (sameIssue) => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const source = await createIssueAndRun(db, company.id, agent.id);
+    const target = await createIssueAndRun(db, company.id, agent.id);
+    const issueId = sameIssue ? source.issue.id : target.issue.id;
+    const targetRun = sameIssue ? (await db.insert(heartbeatRuns).values({
+      companyId: company.id, agentId: agent.id, invocationSource: "assignment", status: "running",
+      contextSnapshot: { issueId, projectId: source.project.id },
+    }).returning())[0]! : target.run;
+    const [parent] = await db.insert(runIdentityContexts).values({
+      companyId: company.id, runId: source.run.id, revision: 1,
+      cause: "assignment", correlationId: randomUUID(), status: "accepted",
+    }).returning();
+    const [context] = await db.insert(runIdentityContexts).values({
+      companyId: company.id, runId: targetRun.id, revision: 1,
+      parentContextId: parent!.id, cause: "assignment", correlationId: randomUUID(), status: "accepted",
+    }).returning();
+    const [run] = await db.update(heartbeatRuns).set({
+      activeIdentityContextId: context!.id,
+    }).where(eq(heartbeatRuns.id, targetRun.id)).returning();
+    const remote = await createRemoteMcpTool(db, company.id, {
+      applicationKey: "cloudflare", toolName: "list_zones", riskLevel: "read",
+    });
+    await allowAllToolsForAgent(db, company.id, agent.id);
+    // Exercise the real provenance walker against persisted parent/run records.
+    // The provider catalog seam avoids external chat setup and provider calls.
+    vi.spyOn(githubChatTools, "githubGuestBotConnectionForSession").mockImplementation(async () => {
+      await chatRunSourceMessageId(db, run!, { provider: "github" });
+      return null;
+    });
+    const descriptor = (providerType: "paperclip_github_chat" | "paperclip_slack_chat") => ({
+      name: `${providerType}:reply`, pluginId: providerType, displayName: "Reply", description: "Chat reply",
+      parametersSchema: { type: "object" }, providerType, risk: "read" as const,
+    });
+    const github = vi.spyOn(githubChatTools, "githubBotToolsForSession")
+      .mockResolvedValue([descriptor("paperclip_github_chat")]);
+    const slack = vi.spyOn(slackChatTools, "slackToolsForSession")
+      .mockResolvedValue([descriptor("paperclip_slack_chat")]);
+    const gateway = createToolGatewayService(db);
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run!.id });
+    const listed = await gateway.listToolsForSession(session.token);
+    expect(listed).toEqual(expect.arrayContaining([expect.objectContaining({ connectionId: remote.connection.id })]));
+    const chat = listed.filter(tool => ["paperclip_github_chat", "paperclip_slack_chat"].includes(tool.providerType ?? ""));
+    expect(chat).toHaveLength(sameIssue ? 2 : 0);
+    if (!sameIssue) { expect(github).not.toHaveBeenCalled(); expect(slack).not.toHaveBeenCalled(); }
+  });
+
+  it.each(["guest", "github", "slack"] as const)("keeps non-provenance %s discovery errors visible", async (helper) => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const gateway = createToolGatewayService(db);
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const guest = vi.spyOn(githubChatTools, "githubGuestBotConnectionForSession").mockResolvedValue(null);
+    const github = vi.spyOn(githubChatTools, "githubBotToolsForSession").mockResolvedValue([]);
+    const slack = vi.spyOn(slackChatTools, "slackToolsForSession").mockResolvedValue([]);
+    for (const error of [new Error("database unavailable"), new HttpError(503, "busy"),
+      forbidden("Unrelated denial"), forbidden("Chat requester provenance changed"),
+      new Error("Chat tools cannot be inherited by another task")]) {
+      ({ guest, github, slack })[helper].mockRejectedValueOnce(error);
+      await expect(gateway.listToolsForSession(session.token)).rejects.toBe(error);
+    }
+  });
+
+  it.each(["github", "slack"] as const)("drops all chat tools on a %s inherited-task denial", async (helper) => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const remote = await createRemoteMcpTool(db, company.id, {
+      applicationKey: "cloudflare", toolName: "list_zones", riskLevel: "read",
+    });
+    await allowAllToolsForAgent(db, company.id, agent.id);
+    vi.spyOn(githubChatTools, "githubGuestBotConnectionForSession").mockResolvedValue(remote.connection.id);
+    const github = vi.spyOn(githubChatTools, "githubBotToolsForSession").mockResolvedValue([{
+      name: "github-chat:reply", pluginId: "github-chat", displayName: "Reply", description: "Chat reply", parametersSchema: { type: "object" },
+      providerType: "paperclip_github_chat", risk: "read",
+    }]);
+    const slack = vi.spyOn(slackChatTools, "slackToolsForSession").mockResolvedValue([]);
+    ({ github, slack })[helper].mockRejectedValue(forbidden("Chat tools cannot be inherited by another task"));
+    const gateway = createToolGatewayService(db);
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const listed = await gateway.listToolsForSession(session.token);
+    expect(listed.some(tool => tool.connectionId === remote.connection.id)).toBe(true);
+    expect(listed.some(tool => ["paperclip_github_chat", "paperclip_slack_chat"].includes(tool.providerType ?? ""))).toBe(false);
   });
 
   it("preserves provider tool errors in MCP responses and failed invocation audits", async () => {
